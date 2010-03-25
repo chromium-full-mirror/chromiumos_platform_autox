@@ -5,11 +5,13 @@
 # found in the LICENSE file.
 
 import re
+import select
 import time
 
 import Xlib.display
 import Xlib.protocol.request
 from Xlib import X
+from Xlib import Xatom
 from Xlib import XK
 from Xlib.ext import xtest
 
@@ -17,7 +19,8 @@ class AutoX(object):
     """AutoX provides an interface for interacting with X applications.
 
     This is done by using the XTEST extension to inject events into the X
-    server.
+    server.  Convenience methods are also provided to query information
+    about windows and to wait for testable conditions to be met.
 
     Example usage:
 
@@ -31,6 +34,25 @@ class AutoX(object):
 
         ax.send_hotkey("Ctrl+L")
         ax.send_text("http://www.example.org/\n")
+
+        # Create a window and wait for it to get the focus.
+        win = ax.create_and_map_window(width=200, height=200, title='test')
+        info = ax.get_window_info(win.id)
+        ax.await_condition(
+            lambda: info.is_focused,
+            desc='Waiting for window 0x%x to be focused' % win.id)
+        ax.destroy_window(win)
+
+        # Create an override-redirect window and check that it appears in
+        # the position that it requested.
+        popup_win = ax.create_and_map_window(
+            x=200, y=200, width=200, height=200,
+            title='popup', override_redirect=True)
+        popup_info = ax.get_window_info(popup_win.id)
+        ax.await_condition(
+            lambda: popup_info.get_geometry() == (200, 200, 200, 200),
+            desc='Checking window 0x%x\'s geometry' % popup_win.id)
+        ax.destroy_window(popup_win)
     """
 
     # Map of characters that can be passed to send_text() that differ
@@ -91,9 +113,37 @@ class AutoX(object):
         def __str__(self):
             return "Invalid keysym \"%s\"" % self.__keysym
 
+    class ConditionTimeoutError(Error):
+        """Error caused by a test condition timing out."""
+        pass
+
+    class WindowInfo:
+        """Container for the latest information we've seen about a window."""
+        def __init__(self, x, y, width, height, expose_callback=None):
+            self.x = x
+            self.y = y
+            self.width = width
+            self.height = height
+            self.expose_callback = expose_callback
+            self.was_exposed = False
+            self.is_focused = False
+
+        def get_geometry(self):
+            """Get a tuple containing the window's position and dimensions.
+
+            Returns:
+                tuple of ints: (x, y, width, height)
+            """
+            return (self.x, self.y, self.width, self.height)
+
     def __init__(self, display_name=None):
         self.__display = Xlib.display.Display(display_name)
         self.__root = self.__display.screen().root
+        self.__windows = {}
+
+        # Make sure that we get notified about property changes on the root
+        # window, since the caller may wait on conditions that use them.
+        self.__root.change_attributes(event_mask=X.PropertyChangeMask)
 
     def __get_keycode_for_keysym(self, keysym):
         """Get the keycode corresponding to a keysym.
@@ -227,6 +277,63 @@ class AutoX(object):
         if char in AutoX.__chars_to_keysyms:
             return AutoX.__chars_to_keysyms[char]
         raise self.InvalidKeySymError(char)
+
+    def await_condition(self, condition, desc='', timeout_sec=10.0):
+        """Wait until a condition becomes true.
+
+        We call the condition whenever we receive events from the X server
+        and return when it becomes true.
+
+        Args:
+            condition: callable object taking no args and returning a bool
+            desc: str describing the condition; just used in exception
+            timeout_sec: maximum time to wait for the condition
+
+        Raises:
+            ConditionTimeoutError: condition didn't occur before timeout
+        """
+        end_time = time.time() + timeout_sec
+        fd = self.__display.fileno()
+
+        while True:
+            self.sync()
+            if condition():
+                return
+
+            remaining_time = end_time - time.time()
+            if remaining_time <= 0:
+                break
+
+            (rfds, wfds, xfds) = select.select([fd], [], [], remaining_time)
+            if not rfds:
+                break
+
+        raise AutoX.ConditionTimeoutError(desc)
+
+    def sync(self):
+        """Flush X request queue and process all pending events.
+        """
+        self.__display.sync()
+        while self.__display.pending_events():
+            event = self.__display.next_event()
+            if event.type == X.ConfigureNotify:
+                info = self.__windows[event.window.id]
+                info.x = event.x
+                info.y = event.y
+                info.width = event.width
+                info.height = event.height
+            elif event.type == X.Expose:
+                info = self.__windows[event.window.id]
+                info.was_exposed = True
+                if info.expose_callback:
+                    info.expose_callback(event)
+                else:
+                    event.window.clear_area(
+                            event.x, event.y, event.width, event.height)
+            elif event.type == X.FocusIn or event.type == X.FocusOut:
+                self.__windows[event.window.id].is_focused = \
+                    (event.type == X.FocusIn)
+
 
     def get_pointer_position(self):
         """Get the pointer's absolute position.
@@ -388,3 +495,106 @@ class AutoX(object):
             xtest.fake_input(
                 self.__display, X.KeyRelease, detail=shift_keycode)
         self.__display.sync()
+
+    def create_and_map_window(self, x=0, y=0, width=200, height=200,
+                              title=None, override_redirect=False,
+                              expose_callback=None):
+        """Create and map a window.
+
+        Waits until the window has been exposed before returning.
+
+        Args:
+            x, y: int position of window
+            width, height: int dimensions of window
+            title: str containing the window's title
+            override_redirect: whether this is an override-redirect
+                ("popup", in GTK's parlance) window.  override-redirect
+                windows are mapped, placed, and sized without any window
+                manager involvement.
+
+        Returns:
+            python-xlib Window object (but see destroy_window())
+        """
+        win = self.__root.create_window(
+            x, y, width, height, border_width=0,
+            depth=X.CopyFromParent,
+            override_redirect=override_redirect,
+            background_pixel=self.__display.screen().white_pixel,
+            event_mask = (X.ExposureMask |
+                          X.FocusChangeMask |
+                          X.StructureNotifyMask))
+
+        info = AutoX.WindowInfo(
+            x, y, width, height, expose_callback=expose_callback)
+        self.__windows[win.id] = info
+
+        if title:
+            win.set_wm_name(title)
+            utf8_atom = self.__display.get_atom('UTF8_STRING')
+            win.change_property(
+                    self.__display.get_atom('_NET_WM_NAME'),
+                    utf8_atom, 8, data=title)
+
+        win.map()
+        self.await_condition(
+            lambda: info.was_exposed,
+            desc='Waiting for window 0x%x to be exposed' % win.id)
+        return win
+
+    def destroy_window(self, window):
+        """Destroy a window returned by create_and_map_window().
+
+        In addition to calling the window's destroy() method, this method
+        cleans up internal state that was being used to track the window.
+
+        Args:
+            window: python-xlib Window object
+        """
+        del self.__windows[window.id]
+        window.destroy()
+
+    def get_window_info(self, window_id):
+        """Get an object containing information about a window.
+
+        Args:
+            window_id: int ID of the window
+
+        Returns:
+            WindowInfo object (should be treated as read-only)
+        """
+        return self.__windows[window_id]
+
+    def get_top_window_id_at_point(self, x, y):
+        """Get the ID of the topmost mapped toplevel window at a given point.
+
+        Note that under reparenting window managers, this may not be the
+        client window that you're expecting.
+
+        Args:
+            x, y: int position of point
+
+        Returns:
+            int containing the ID of the window at the point, or 0 if no
+            window is there
+        """
+        reply = self.__root.query_tree()
+        for win in reversed(reply.children):
+            attr = win.get_attributes()
+            if attr.map_state == X.IsViewable:
+                geom = win.get_geometry()
+                if (geom.x <= x and geom.y <= y and
+                    geom.x + geom.width > x and geom.y + geom.height > y):
+                    return win.id
+        return 0
+
+    def get_active_window_property(self):
+        """Get the root window's _NET_ACTIVE_WINDOW property.
+
+        Returns:
+            int window ID from the property, or None if unset
+        """
+        reply = self.__root.get_property(
+            self.__display.get_atom('_NET_ACTIVE_WINDOW'), Xatom.WINDOW, 0, 1)
+        if not reply:
+            return None
+        return reply.value[0]
