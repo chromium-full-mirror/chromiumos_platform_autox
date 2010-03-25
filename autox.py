@@ -41,7 +41,7 @@ class AutoX(object):
         ax.await_condition(
             lambda: info.is_focused,
             desc='Waiting for window 0x%x to be focused' % win.id)
-        ax.destroy_window(win)
+        win.destroy()
 
         # Create an override-redirect window and check that it appears in
         # the position that it requested.
@@ -52,7 +52,7 @@ class AutoX(object):
         ax.await_condition(
             lambda: popup_info.get_geometry() == (200, 200, 200, 200),
             desc='Checking window 0x%x\'s geometry' % popup_win.id)
-        ax.destroy_window(popup_win)
+        popup_win.destroy()
     """
 
     # Map of characters that can be passed to send_text() that differ
@@ -322,6 +322,8 @@ class AutoX(object):
                 info.y = event.y
                 info.width = event.width
                 info.height = event.height
+            elif event.type == X.DestroyNotify:
+                del self.__windows[event.window.id]
             elif event.type == X.Expose:
                 info = self.__windows[event.window.id]
                 info.was_exposed = True
@@ -513,8 +515,14 @@ class AutoX(object):
                 manager involvement.
 
         Returns:
-            python-xlib Window object (but see destroy_window())
+            python-xlib Window object
         """
+        # Sync before creating the window.  It's possible that we're
+        # reusing the ID from an already-destroyed window that we haven't
+        # seen a DestroyNotify event about yet, and we want to make sure
+        # that its WindowInfo object gets cleaned up before we register ours.
+        self.sync()
+
         win = self.__root.create_window(
             x, y, width, height, border_width=0,
             depth=X.CopyFromParent,
@@ -523,8 +531,7 @@ class AutoX(object):
             event_mask = (X.ExposureMask |
                           X.FocusChangeMask |
                           X.StructureNotifyMask))
-
-        info = AutoX.WindowInfo(
+        info = self.WindowInfo(
             x, y, width, height, expose_callback=expose_callback)
         self.__windows[win.id] = info
 
@@ -539,19 +546,8 @@ class AutoX(object):
         self.await_condition(
             lambda: info.was_exposed,
             desc='Waiting for window 0x%x to be exposed' % win.id)
+
         return win
-
-    def destroy_window(self, window):
-        """Destroy a window returned by create_and_map_window().
-
-        In addition to calling the window's destroy() method, this method
-        cleans up internal state that was being used to track the window.
-
-        Args:
-            window: python-xlib Window object
-        """
-        del self.__windows[window.id]
-        window.destroy()
 
     def get_window_info(self, window_id):
         """Get an object containing information about a window.
@@ -598,3 +594,12 @@ class AutoX(object):
         if not reply:
             return None
         return reply.value[0]
+
+    def get_screen_size(self):
+        """Get the current dimensions of the root window.
+
+        Returns:
+            tuple with two ints: (width, height)
+        """
+        reply = self.__root.get_geometry()
+        return (reply.width, reply.height)
