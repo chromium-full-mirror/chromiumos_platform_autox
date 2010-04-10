@@ -93,6 +93,14 @@ class AutoX(object):
         '?': 'question',
     }
 
+    # python-xlib doesn't know about these keysyms, so we hardcode the
+    # constants from (the real) Xlib's /usr/include/X11/XF86keysym.h.
+    __extra_keysyms = {
+        'XF86AudioLowerVolume': 0x1008ff11,
+        'XF86AudioMute': 0x1008ff12,
+        'XF86AudioRaiseVolume': 0x1008ff13,
+    }
+
     class Error(Exception):
         """Base exception class for AutoX."""
         pass
@@ -145,6 +153,19 @@ class AutoX(object):
         # window, since the caller may wait on conditions that use them.
         self.__root.change_attributes(event_mask=X.PropertyChangeMask)
 
+    def __get_keysym_num_for_keysym(self, keysym_str):
+        """Get the keysym number corresponding to a keysym's name.
+
+        Args:
+            keysym_str: keysym name as str
+
+        Returns:
+            integer keysym number, or XK.NoSymbol if invalid
+        """
+        if keysym_str in AutoX.__extra_keysyms:
+            return AutoX.__extra_keysyms[keysym_str]
+        return XK.string_to_keysym(keysym_str)
+
     def __get_keycode_for_keysym(self, keysym):
         """Get the keycode corresponding to a keysym.
 
@@ -159,7 +180,7 @@ class AutoX(object):
             RuntimeError: unable to map the keysym to a keycode (maybe it
                 isn't present in the current keymap)
         """
-        keysym_num = XK.string_to_keysym(keysym)
+        keysym_num = self.__get_keysym_num_for_keysym(keysym)
         if keysym_num == XK.NoSymbol:
             raise self.InvalidKeySymError(keysym)
         keycode = self.__display.keysym_to_keycode(keysym_num)
@@ -182,7 +203,7 @@ class AutoX(object):
             RuntimeError: unable to map the keysym to a keycode (maybe it
                 isn't present in the current keymap)
         """
-        keysym_num = XK.string_to_keysym(keysym)
+        keysym_num = self.__get_keysym_num_for_keysym(keysym)
         if keysym_num == XK.NoSymbol:
             raise self.InvalidKeySymError(keysym)
         # This gives us a list of (keycode, index) tuples, sorted by index and
