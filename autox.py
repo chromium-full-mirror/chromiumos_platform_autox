@@ -594,15 +594,21 @@ class AutoX(object):
             int containing the ID of the window at the point, or 0 if no
             window is there
         """
-        reply = self.__root.query_tree()
-        for win in reversed(reply.children):
-            attr = win.get_attributes()
-            if attr.map_state == X.IsViewable:
-                geom = win.get_geometry()
-                if (geom.x <= x and geom.y <= y and
-                    geom.x + geom.width > x and geom.y + geom.height > y):
-                    return win.id
-        return 0
+        self.__display.grab_server()
+        try:
+            reply = self.__root.query_tree()
+            for win in reversed(reply.children):
+                attr = win.get_attributes()
+                if (attr.map_state == X.IsViewable and
+                    attr.win_class == X.InputOutput):
+                    geom = win.get_geometry()
+                    if (geom.x <= x and geom.y <= y and
+                        geom.x + geom.width > x and geom.y + geom.height > y):
+                        return win.id
+            return 0
+        finally:
+            self.__display.ungrab_server()
+            self.sync()
 
     def get_active_window_property(self):
         """Get the root window's _NET_ACTIVE_WINDOW property.
