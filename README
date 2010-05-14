@@ -1,3 +1,0 @@
-autox is a program for automating interaction with the X server by reading
-a list of events from a script file and injecting them using the XTEST
-extension.
